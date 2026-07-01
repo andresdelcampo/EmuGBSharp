@@ -29,7 +29,7 @@ namespace ZarthGB
             else
                 //emulator.LoadCartridge("bgbtest.gb");
                 emulator.LoadCartridge("tetris.gb");
-                emulator.LoadCartridge("sml.gb");
+                //emulator.LoadCartridge("sml.gb");
             
             // CPU tests
             //emulator.LoadCartridge("01-special.gb");              // OK!

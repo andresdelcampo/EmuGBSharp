@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using NAudio.Wave;
+using NAudio.Wave.SampleProviders;
 
 // References:
 // - http://marc.rawer.de/Gameboy/Docs/GBCPUman.pdf probably the best GameBoy CPU/memory manual
@@ -21,9 +22,8 @@ namespace ZarthGB
         private const int NumChannels = 1;
         private Stopwatch stopwatch = new Stopwatch();
         private TimeSpan lastTime;
-        private MixingWaveProvider32 leftChannel, rightChannel;
-        private MultiplexingWaveProvider mixer;
-        private WaveOut waveOut = new WaveOut();
+        private IWaveProvider mixer;
+        private IWavePlayer waveOut;
         private int buffering;
         private const int BufferingRounds = 4;
         
@@ -333,25 +333,148 @@ namespace ZarthGB
 
         public void SetSoundOutput()
         {
-            leftChannel = new MixingWaveProvider32();
-            rightChannel = new MixingWaveProvider32();
+            mixer = new SoundMixer(this);
 
-            if (Sound1ToLeft) leftChannel.AddInputStream(waveBuffer1);
-            if (Sound2ToLeft) leftChannel.AddInputStream(waveBuffer2);
-            if (Sound3ToLeft) leftChannel.AddInputStream(waveBuffer3);
-            if (Sound4ToLeft) leftChannel.AddInputStream(waveBuffer4);
-            if (Sound1ToRight) rightChannel.AddInputStream(waveBuffer1);
-            if (Sound2ToRight) rightChannel.AddInputStream(waveBuffer2);
-            if (Sound3ToRight) rightChannel.AddInputStream(waveBuffer3);
-            if (Sound4ToRight) rightChannel.AddInputStream(waveBuffer4);
-            
-            mixer = new MultiplexingWaveProvider(new [] { leftChannel, rightChannel }, 2);
-            mixer.ConnectInputToOutput(0, 0);
-            mixer.ConnectInputToOutput(1, 1);
+            waveOut?.Stop();
+            waveOut?.Dispose();
 
-            waveOut = new WaveOut();
-            waveOut.DesiredLatency = DesiredLatency; 
-            waveOut.Init(mixer);
+            waveOut = CreateSoundPlayer(mixer);
+        }
+
+        private IWavePlayer CreateSoundPlayer(IWaveProvider waveProvider)
+        {
+            if (TryCreateSoundPlayer(CreateWaveOutPlayer, waveProvider, "WaveOut", out var player))
+                return player;
+
+            var standardWaveProvider = CreateStandardOutputProvider(waveProvider);
+
+            if (TryCreateSoundPlayer(CreateDirectSoundPlayer, standardWaveProvider, "DirectSound standard PCM", out player))
+                return player;
+
+            if (TryCreateSoundPlayer(CreateWaveOutPlayer, standardWaveProvider, "WaveOut standard PCM", out player))
+                return player;
+
+            if (TryCreateSoundPlayer(() => new WaveOutEvent { DesiredLatency = DesiredLatency }, standardWaveProvider, "WaveOutEvent standard PCM", out player))
+                return player;
+
+            throw new InvalidOperationException("No compatible sound output could be initialized.");
+        }
+
+        private WaveOut CreateWaveOutPlayer()
+        {
+            return new WaveOut
+            {
+                DesiredLatency = DesiredLatency
+            };
+        }
+
+        private DirectSoundOut CreateDirectSoundPlayer()
+        {
+            return new DirectSoundOut(DesiredLatency);
+        }
+
+        private IWaveProvider CreateStandardOutputProvider(IWaveProvider waveProvider)
+        {
+            var resampledProvider = new WdlResamplingSampleProvider(waveProvider.ToSampleProvider(), 48000);
+            return resampledProvider.ToWaveProvider16();
+        }
+
+        private bool TryCreateSoundPlayer(Func<IWavePlayer> playerFactory, IWaveProvider waveProvider, string name, out IWavePlayer player)
+        {
+            player = null;
+
+            try
+            {
+                player = playerFactory();
+                player.Init(waveProvider);
+                return true;
+            }
+            catch (Exception exception)
+            {
+                Debug.Print($"{name} rejected sound format ({exception.Message}).");
+                player?.Dispose();
+                player = null;
+                return false;
+            }
+        }
+
+        private class SoundMixer : IWaveProvider
+        {
+            private readonly Sound sound;
+            private byte[] sound1Buffer = Array.Empty<byte>();
+            private byte[] sound2Buffer = Array.Empty<byte>();
+            private byte[] sound3Buffer = Array.Empty<byte>();
+            private byte[] sound4Buffer = Array.Empty<byte>();
+
+            public SoundMixer(Sound sound)
+            {
+                this.sound = sound;
+                WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(SampleRate, 2);
+            }
+
+            public WaveFormat WaveFormat { get; }
+
+            public int Read(byte[] buffer, int offset, int count)
+            {
+                Array.Clear(buffer, offset, count);
+
+                int sampleFrames = count / WaveFormat.BlockAlign;
+                int monoBytes = sampleFrames * sizeof(float);
+
+                EnsureBuffer(ref sound1Buffer, monoBytes);
+                EnsureBuffer(ref sound2Buffer, monoBytes);
+                EnsureBuffer(ref sound3Buffer, monoBytes);
+                EnsureBuffer(ref sound4Buffer, monoBytes);
+
+                int sound1Bytes = sound.waveBuffer1.Read(sound1Buffer, 0, monoBytes);
+                int sound2Bytes = sound.waveBuffer2.Read(sound2Buffer, 0, monoBytes);
+                int sound3Bytes = sound.waveBuffer3.Read(sound3Buffer, 0, monoBytes);
+                int sound4Bytes = sound.waveBuffer4.Read(sound4Buffer, 0, monoBytes);
+
+                for (int frame = 0; frame < sampleFrames; frame++)
+                {
+                    int monoOffset = frame * sizeof(float);
+                    float left = 0.0f;
+                    float right = 0.0f;
+
+                    AddSample(sound1Buffer, sound1Bytes, monoOffset, sound.Sound1ToLeft, sound.Sound1ToRight, ref left, ref right);
+                    AddSample(sound2Buffer, sound2Bytes, monoOffset, sound.Sound2ToLeft, sound.Sound2ToRight, ref left, ref right);
+                    AddSample(sound3Buffer, sound3Bytes, monoOffset, sound.Sound3ToLeft, sound.Sound3ToRight, ref left, ref right);
+                    AddSample(sound4Buffer, sound4Bytes, monoOffset, sound.Sound4ToLeft, sound.Sound4ToRight, ref left, ref right);
+
+                    int outputOffset = offset + (frame * WaveFormat.BlockAlign);
+                    WriteFloat(buffer, outputOffset, left);
+                    WriteFloat(buffer, outputOffset + sizeof(float), right);
+                }
+
+                return count;
+            }
+
+            private static void EnsureBuffer(ref byte[] buffer, int length)
+            {
+                if (buffer.Length < length)
+                    buffer = new byte[length];
+            }
+
+            private static void AddSample(byte[] buffer, int bytesRead, int offset, bool toLeft, bool toRight, ref float left, ref float right)
+            {
+                if (offset + sizeof(float) > bytesRead)
+                    return;
+
+                float sample = BitConverter.ToSingle(buffer, offset);
+
+                if (toLeft)
+                    left += sample;
+
+                if (toRight)
+                    right += sample;
+            }
+
+            private static void WriteFloat(byte[] buffer, int offset, float value)
+            {
+                byte[] bytes = BitConverter.GetBytes(Math.Clamp(value, -1.0f, 1.0f));
+                Buffer.BlockCopy(bytes, 0, buffer, offset, bytes.Length);
+            }
         }
 
         public void Reset()
