@@ -16,14 +16,21 @@ namespace ZarthGB
         const ushort VideoRamBegin = 0x8000;
         const ushort OamBegin = 0xfe00;
 
+        const double FrameRateHz = 59.727500569606;
+        // Full DMG frame period (~16.75 ms), used only by the wall-clock fallback pacer.
+        TimeSpan expectedFrameTime = TimeSpan.FromTicks((long) (TimeSpan.TicksPerSecond / FrameRateHz));
+
+        // Audio-master pacing: emulated audio position vs what the device has actually consumed.
+        const double AudioLeadSeconds = 0.15;   // how far emulation may run ahead of consumption
+        const int AudioStallMs = 600;           // no consumption progress this long => treat device as stalled
+        double emulatedSamples;
+        long pacingLastConsumed;
+        bool audioPacing;
+        bool audioStalled;
+        Stopwatch pacingStall = new Stopwatch();
+
+        // Wall-clock fallback (used only when the audio device is not running).
         Stopwatch stopwatch = new Stopwatch();
-        // Full DMG frame period (~16.75 ms). The sleep in Step() paces one whole frame; the previous
-        // "/ 2" was a hack tuned to Windows' coarse ~15.6 ms Thread.Sleep granularity, which no longer
-        // applies now that Program raises the timer resolution to 1 ms.
-        TimeSpan expectedFrameTime = TimeSpan.FromTicks((long) (TimeSpan.TicksPerSecond / 59.727500569606));
-        // Absolute target for the next frame boundary. Pacing against a running timeline (rather than
-        // restarting the clock each frame) makes small Thread.Sleep overshoots cancel out instead of
-        // accumulating, so the long-term rate stays exact and the audio clock hears no periodic drift.
         TimeSpan nextFrameTime;
         public bool frameReady = false;
         public bool IsFrameReady
@@ -164,13 +171,70 @@ namespace ZarthGB
             }
         }
 
-        // Throttle one emulated frame to real time. Sleeps for the bulk of the wait (cheap, yields
-        // the CPU to the audio thread) then spin-waits the final ~1.5 ms, because Thread.Sleep only
-        // guarantees a *minimum* and jitters. The target advances on a fixed timeline so overshoots
-        // self-correct; if we ever fall more than a frame behind we resync instead of racing to
-        // catch up (which is what produced the periodic "rush").
+        // Throttle emulation to real time. The authoritative clock is the audio device: we advance
+        // an emulated-audio-sample counter each frame and wait until emulation is no more than a
+        // small lead ahead of what the device has actually consumed. That slaves emulation speed to
+        // the sound card's crystal, so note production and playback never drift apart (which is what
+        // caused the periodic tempo wobble). If the device is not running -- or stalls -- we fall
+        // back to a precise self-correcting wall-clock pacer so the emulator never freezes.
         private void PaceFrame()
         {
+            double sampleRate = memory.AudioSampleRate;
+
+            if (memory.AudioDeviceRunning)
+            {
+                long consumed = memory.AudioSamplesConsumed;
+
+                // Recover from a previous stall only once the device actually starts consuming again.
+                if (audioStalled && consumed != pacingLastConsumed)
+                {
+                    audioStalled = false;
+                    audioPacing = false;   // force a clean rebase below
+                }
+
+                if (!audioStalled)
+                {
+                    stopwatch.Reset();   // discard the wall-clock baseline; audio is in control now
+
+                    // Allow emulation to run a little ahead of playback (keeps video smooth and the
+                    // device buffer fed) but no further, so the long-term rate matches consumption.
+                    double lead = sampleRate * AudioLeadSeconds;
+
+                    if (!audioPacing)
+                    {
+                        // Took over from the fallback: rebase onto the current playback position so we
+                        // neither stall catching up nor race ahead after the handoff.
+                        audioPacing = true;
+                        emulatedSamples = consumed + lead;
+                        pacingLastConsumed = consumed;
+                        pacingStall.Restart();
+                    }
+
+                    emulatedSamples += sampleRate / FrameRateHz;
+
+                    while (emulatedSamples - memory.AudioSamplesConsumed > lead)
+                    {
+                        long c = memory.AudioSamplesConsumed;
+                        if (c != pacingLastConsumed) { pacingLastConsumed = c; pacingStall.Restart(); }
+                        else if (pacingStall.ElapsedMilliseconds > AudioStallMs) { audioStalled = true; break; }
+                        System.Threading.Thread.Sleep(1);
+                    }
+
+                    if (!audioStalled)
+                        return;   // paced by the audio clock this frame
+
+                    // Device reports Playing but isn't consuming. Fall through to the wall-clock pacer
+                    // so we keep real-time speed (never free-run); pacingLastConsumed stays frozen so
+                    // the recovery check above re-engages audio pacing as soon as the device advances.
+                }
+            }
+            else
+            {
+                audioPacing = false;
+                audioStalled = false;
+            }
+
+            // ---- Wall-clock fallback (device not running, or stalled) ----
             if (!stopwatch.IsRunning)
             {
                 stopwatch.Start();

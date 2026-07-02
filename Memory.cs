@@ -141,6 +141,11 @@ namespace ZarthGB
 			sound.Stop();
 		}
 
+		// Audio-clock accessors used by Video's frame pacer to slave emulation to the sound device.
+		public long AudioSamplesConsumed => sound.SamplesConsumed;
+		public bool AudioDeviceRunning => sound.DeviceRunning;
+		public int AudioSampleRate => sound.OutputSampleRate;
+
 		public void IncrementDiv()
 		{
 			memory[0xff04]++;

@@ -9,16 +9,67 @@ using NAudio.Wave.SampleProviders;
 // - https://nightshade256.github.io/2021/03/27/gb-sound-emulation.html
 // - https://gbdev.io/pandocs/Audio.html
 //
-// Design: the four sound channels form a single Audio Processing Unit (APU) that implements
-// ISampleProvider. The output device *pulls* samples from it at the true playback rate, so the
-// device's own clock is the single authoritative timebase. This removes the whole class of bugs
-// the old push-based code had (per-channel buffer over/underruns, inter-channel latency drift,
-// coarse per-chunk register sampling). Each channel is a persistent object that keeps its own
-// phase; the CPU thread only ever writes the 0xFF10-0xFF26 register block and flags triggers,
-// while the audio thread reads that state one sample at a time.
+// ============================================================================================
+//  ZarthGB APU (Audio Processing Unit) — how the sound system works
+// ============================================================================================
+//
+// PULL-BASED, DEVICE-IS-THE-CLOCK
+//   The four Game Boy sound channels are mixed by a single `ApuProvider : ISampleProvider`. The
+//   output device *pulls* from it (`ApuProvider.Read`) one buffer at a time at the real playback
+//   rate, so the sound card's crystal is the one authoritative timebase. Nothing is ever "pushed":
+//   there is no intermediate sample queue to overflow or starve, and no per-channel drift. (The old
+//   design pushed bursts into four BufferedWaveProviders and suffered skips, gaps and channel
+//   desync — that code, and GBSignalGenerator.cs, are gone.)
+//
+// PER-SAMPLE PIPELINE (all on the audio thread, in `NextFrame`)
+//   For every stereo frame the device requests:
+//     1. Apply any pending channel triggers (see threading below).
+//     2. Advance the 512 Hz frame sequencer, which clocks length (256 Hz), sweep (128 Hz) and
+//        envelope (64 Hz) exactly like hardware.
+//     3. Sample all four channels at native 48 kHz (each uses a phase accumulator, so pitch is
+//        accurate without oversampling/resampling).
+//     4. Mix: route each channel to L/R per NR51, scale by the NR50 master volume, divide by the
+//        channel count to stay within [-1, 1].
+//   `UpdateStatusRegister` then writes the live on/off bits back to NR52 so games can poll them.
+//
+// CHANNELS (persistent objects, one per hardware channel — see the #region Channels)
+//   channel1  SquareChannel with frequency sweep   (NR10-NR14, 0xFF10-0xFF14)
+//   channel2  SquareChannel, no sweep              (NR21-NR24, 0xFF16-0xFF19)
+//   channel3  WaveChannel, 32×4-bit wave RAM       (NR30-NR34 + 0xFF30-0xFF3F)
+//   channel4  NoiseChannel, 15/7-bit LFSR          (NR41-NR44, 0xFF20-0xFF23)
+//   Each keeps its own phase, envelope, length counter (and sweep for ch1) across calls.
+//
+// REGISTER INTERFACE / THREADING (two threads, minimal shared state)
+//   * Emulator (CPU) thread: writes the 0xFF10-0xFF26 register block through Memory as the game
+//     runs, and on a trigger write (NRx4 bit 7) calls StartSoundN, which sets a `volatile` trigger
+//     flag. That is the only thing it hands to the audio side.
+//   * Audio thread: reads those registers *live* each sample (so frequency/volume/duty changes take
+//     effect immediately) and consumes the trigger flags in `ApplyPendingTriggers`.
+//   Shared state is just: the register bytes (single-byte reads/writes are atomic), the volatile
+//   trigger flags, and `samplesConsumed` (Interlocked). No locks are needed.
+//
+// AUDIO IS ALSO THE EMULATION CLOCK
+//   `samplesConsumed` counts stereo frames the device has actually pulled. `Video.PaceFrame` reads
+//   it (via Memory.AudioSamplesConsumed) and throttles the whole emulator to stay just ahead of it,
+//   slaving emulation speed to the sound card. That is what keeps game tempo and audio playback
+//   from drifting apart. See Video.cs for the pacing/fallback logic.
+//
+// OUTPUT DEVICE
+//   `CreateSoundPlayer` picks the first backend that initialises (16-bit PCM preferred; float and
+//   several backends are tried in turn — see the fallback chain). The device is started once and
+//   nudged by `EnsurePlaying` (called periodically from Memory.IncrementDiv) in case it wasn't
+//   ready at construction, and is stopped/disposed by `Stop()` on shutdown so it never keeps the
+//   sound device (or the process) locked between runs.
+//
+// LATENCY = device buffer (DesiredLatency) + the pacer's lead in Video.PaceFrame.
+// ============================================================================================
 
 namespace ZarthGB
 {
+    // Pull-based Game Boy APU. See the file header for the full overview: the output device pulls
+    // mixed stereo frames from the nested ApuProvider, four persistent channels synthesise at
+    // 48 kHz driven by a 512 Hz frame sequencer, registers 0xFF10-0xFF26 are read live, and
+    // `SamplesConsumed` doubles as the emulator's master clock (consumed by Video.PaceFrame).
     class Sound
     {
         private const int SampleRate = 48000;
@@ -29,6 +80,14 @@ namespace ZarthGB
 
         private readonly Memory memory;
         private IWavePlayer waveOut;
+
+        // Total stereo frames the output device has pulled. Advanced on the audio thread and read by
+        // the emulator thread's frame pacer, so emulation can be slaved to the sound card's clock.
+        private long samplesConsumed;
+
+        public long SamplesConsumed => System.Threading.Interlocked.Read(ref samplesConsumed);
+        public bool DeviceRunning => waveOut != null && waveOut.PlaybackState == PlaybackState.Playing;
+        public int OutputSampleRate => SampleRate;
 
         private readonly SquareChannel channel1;
         private readonly SquareChannel channel2;
@@ -96,6 +155,9 @@ namespace ZarthGB
 
         #region Mixing / frame sequencer (audio thread)
 
+        // Produce one mixed stereo frame: apply triggers, advance the frame sequencer, sample the
+        // four channels, then route (NR51) and scale (NR50) them into left/right. Called once per
+        // output frame from ApuProvider.Read on the audio thread. (See the file header overview.)
         private void NextFrame(out float left, out float right)
         {
             ApplyPendingTriggers();
@@ -219,6 +281,7 @@ namespace ZarthGB
                     buffer[offset + i + 1] = right;
                 }
                 sound.UpdateStatusRegister();
+                System.Threading.Interlocked.Add(ref sound.samplesConsumed, count / 2);
                 return count;
             }
         }
