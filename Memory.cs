@@ -135,23 +135,23 @@ namespace ZarthGB
 	        Reset();
 	        sound = new Sound(this);
 		}
-        
+
+		public void StopSound()
+		{
+			sound.Stop();
+		}
+
 		public void IncrementDiv()
 		{
 			memory[0xff04]++;
 
-			// Modulo 16 (1024 times per second or less to keep sound channels synchronized)
-			//const int soundStep = (16384 / Sound.PlayStep);
-			const int soundStep = 256;
-			if (memory[0xff04] % soundStep == 0)
-				SoundStep();
+			// Audio timing is driven by the sound device pulling samples, but we still poke the
+			// device periodically so it starts/recovers (the initial Play() can run before it is
+			// ready). Cheap no-op once it is already playing.
+			if (memory[0xff04] % 256 == 0)
+				sound.EnsurePlaying();
 		}
 
-		public void SoundStep()
-		{
-			sound.Play();
-		}
-		
 		public void Reset()
 		{
 			Tiles = new byte[384,8,8];
@@ -345,9 +345,6 @@ namespace ZarthGB
 			        sound.StartSound3();
 		        else if (address == 0xff23)
 			        sound.StartSound4();
-		        else if ((address == 0xff24 && value != memory[0xff24]) ||
-						 (address == 0xff25 && value != memory[0xff25]))
-			        sound.SetSoundOutput();
 
 		        // OAM DMA
 		        else if (address == 0xff46)

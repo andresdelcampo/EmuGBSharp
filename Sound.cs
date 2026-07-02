@@ -1,387 +1,260 @@
-﻿using System;
-using System.Collections.Generic;
+using System;
 using System.Diagnostics;
-using System.Linq;
+using NAudio.CoreAudioApi;
 using NAudio.Wave;
 using NAudio.Wave.SampleProviders;
 
 // References:
 // - http://marc.rawer.de/Gameboy/Docs/GBCPUman.pdf probably the best GameBoy CPU/memory manual
 // - https://nightshade256.github.io/2021/03/27/gb-sound-emulation.html
-// - https://github.com/naudio/NAudio/blob/master/Docs/PlaySineWave.md
+// - https://gbdev.io/pandocs/Audio.html
+//
+// Design: the four sound channels form a single Audio Processing Unit (APU) that implements
+// ISampleProvider. The output device *pulls* samples from it at the true playback rate, so the
+// device's own clock is the single authoritative timebase. This removes the whole class of bugs
+// the old push-based code had (per-channel buffer over/underruns, inter-channel latency drift,
+// coarse per-chunk register sampling). Each channel is a persistent object that keeps its own
+// phase; the CPU thread only ever writes the 0xFF10-0xFF26 register block and flags triggers,
+// while the audio thread reads that state one sample at a time.
 
 namespace ZarthGB
 {
     class Sound
     {
-        public const int PlayStep = 16;  // In ms
-        public const int DesiredLatency = 160;      // PS 8 -> DL 156
+        private const int SampleRate = 48000;
+        private const int NumChannels = 2;
+        private const int DesiredLatency = 150;     // ms of device buffering -> overall audio latency
+        private const int CpuFrequency = 4194304;   // 4.19 MHz
+        private const double FrameSequencerHz = 512.0;
 
-        // How much audio we try to keep queued per channel. The output device drains these
-        // buffers at the true playback rate; each Play() only tops them back up to this level,
-        // so the amount synthesized is paced by real consumption (feedback loop) rather than by
-        // guessing elapsed time. Must comfortably exceed one device read to avoid underruns.
-        private const int TargetBufferMs = DesiredLatency;
-
-        private Memory memory;
-        private const int SampleRate = 192000;    // Minimum 192kHz to get enough frequency resolution -else sounds distorted
-        private const int NumChannels = 1;
-        private IWaveProvider mixer;
+        private readonly Memory memory;
         private IWavePlayer waveOut;
-        
-        private byte ChannelControl => memory[0xff24];
-        private int RightVolume => (ChannelControl >> 4) & 7;
-        private int LeftVolume => ChannelControl & 7;
-        private bool RightVinFromCartridge => (ChannelControl & 0x80) != 0;
-        private bool LeftVinFromCartridge => (ChannelControl & 0x08) != 0;
-        
-        private byte Output => memory[0xff25];
-        private bool Sound4ToRight => (Output & 0x80) != 0;
-        private bool Sound3ToRight => (Output & 0x40) != 0;
-        private bool Sound2ToRight => (Output & 0x20) != 0;
-        private bool Sound1ToRight => (Output & 0x10) != 0;
-        private bool Sound4ToLeft => (Output & 0x08) != 0;
-        private bool Sound3ToLeft => (Output & 0x04) != 0;
-        private bool Sound2ToLeft => (Output & 0x02) != 0;
-        private bool Sound1ToLeft => (Output & 0x01) != 0;
-        
-        
-        private byte OnOff 
-        {
-            get => memory[0xff26];
-            set => memory[0xff26] = value;
-        }
-        private bool Sound1On => (OnOff & 1) != 0;
-        private bool Sound2On => (OnOff & (1 << 1)) != 0;
-        private bool Sound3On => (OnOff & (1 << 2)) != 0;
-        private bool Sound4On => (OnOff & (1 << 3)) != 0;
-        
-        #region Sound1
-        private GBSignalGenerator signal1;
-        private BufferedWaveProvider waveBuffer1;
-        private byte Sweep1 => memory[0xff10];
-        private int SweepShift => Sweep1 & 0x7; 
-        private bool SweepAmplify => (Sweep1 & 0x8) == 0;
-        private int SweepPeriod => (Sweep1 >> 4) & 0x7;
-        private byte WaveLength1 => memory[0xff11];
-        private int WaveDuty1 => WaveLength1 >> 6;
-        private int Length1 => (64 - (WaveLength1 & 0x3F)) * 4;
-        private int lengthPlayed1 = 0;
-        private byte Envelope1 => memory[0xff12];
-        private double Volume1 => (Envelope1 >> 4) / 15.0;
-        private bool EnvelopeAmplify1 => (Envelope1 & 0x8) != 0;
-        private int EnvelopePeriod1 => (Envelope1 & 0x7);
-        private bool TriggerSound1 => (memory[0xff14] >> 7) != 0;
-        private int Frequency1 => ((memory[0xff14] & 7) << 8) | memory[0xff13];
-        private bool Loop1 => (memory[0xff14] & 0x40) == 0;
-        
-        public void StartSound1()
-        {
-            if (TriggerSound1)
-            {
-                if (SweepPeriod == 0)
-                {
-                    // No sweep
-                    signal1 = new GBSignalGenerator(SampleRate, NumChannels)
-                    {
-                        Channel = GBSignalGenerator.ChannelType.Square,
-                        Gain = Volume1,
-                        Frequency = Frequency1,
-                        WaveDuty = WaveDuty1,
-                        EnvelopeAmplify = EnvelopeAmplify1,
-                        EnvelopePeriod = EnvelopePeriod1,
-                    };
-                }
-                else
-                {
-                    // Sweep
-                    signal1 = new GBSignalGenerator(SampleRate, NumChannels)
-                    {
-                        Channel = GBSignalGenerator.ChannelType.Sweep,
-                        Gain = Volume1,
-                        Frequency = Frequency1,
-                        WaveDuty = WaveDuty1,
-                        EnvelopeAmplify = EnvelopeAmplify1,
-                        EnvelopePeriod = EnvelopePeriod1,
-                        SweepPeriod = SweepPeriod,
-                        SweepAmplify = SweepAmplify,
-                        SweepShift = SweepShift,
-                    };
-                    Debug.Print($"QUEUE SWEEP Amplify {SweepAmplify}, Period {SweepPeriod}, Shift {SweepShift}");
-                }
-                
-                SetSound1On();
-            }
-        }
 
-        private void SetSound1On()
-        {
-            lengthPlayed1 = 0;
-            OnOff = (byte) (OnOff | 0x01);
-        }
+        private readonly SquareChannel channel1;
+        private readonly SquareChannel channel2;
+        private readonly WaveChannel channel3;
+        private readonly NoiseChannel channel4;
 
-        private void SetSound1Off()
-        {
-            OnOff = (byte) (OnOff & 0xFE);      // 11111110
-            lengthPlayed1 = 0;
-            signal1 = null;
-        }
+        // Set on the CPU thread when a trigger bit is written, consumed on the audio thread.
+        private volatile bool trigger1;
+        private volatile bool trigger2;
+        private volatile bool trigger3;
+        private volatile bool trigger4;
 
-        #endregion
+        // Frame sequencer (512 Hz) fractional accumulator and step counter.
+        private double frameSequencerAccumulator;
+        private int frameSequencerStep;
 
-        #region Sound2
-        private GBSignalGenerator signal2;
-        private BufferedWaveProvider waveBuffer2;
-        private byte WaveLength2 => memory[0xff16];
-        private int WaveDuty2 => WaveLength2 >> 6;
-        private int Length2 => (64 - (WaveLength2 & 0x3F)) * 4;
-        private int lengthPlayed2 = 0;
-        private byte Envelope2 => memory[0xff17];
-        private double Volume2 => (Envelope2 >> 4) / 15.0;
-        private bool EnvelopeAmplify2 => (Envelope2 & 0x8) != 0;
-        private int EnvelopePeriod2 => (Envelope2 & 0x7);
-        private bool TriggerSound2 => (memory[0xff19] >> 7) != 0;
-        private int Frequency2 => ((memory[0xff19] & 7) << 8) | memory[0xff18];
-        private bool Loop2 => (memory[0xff19] & 0x40) == 0;
-
-        public void StartSound2()
-        {
-            if (TriggerSound2)
-            {
-                signal2 = new GBSignalGenerator(SampleRate, NumChannels)
-                {
-                    Channel = GBSignalGenerator.ChannelType.Square,
-                    Gain = Volume2,
-                    Frequency = Frequency2,
-                    WaveDuty = WaveDuty2,
-                    EnvelopeAmplify = EnvelopeAmplify2,
-                    EnvelopePeriod = EnvelopePeriod2,
-                };
-
-                SetSound2On();
-            }
-        }
-
-        private void SetSound2On()
-        {
-            lengthPlayed2 = 0;
-            OnOff = (byte) (OnOff | 0x02);
-        }
-
-        private void SetSound2Off()
-        {
-            OnOff = (byte) (OnOff & 0xFD);      // 11111101
-            lengthPlayed2 = 0;
-            signal2 = null;
-        }
-
-        #endregion
-
-        #region Sound3
-        private GBSignalGenerator signal3;
-        private BufferedWaveProvider waveBuffer3;
-        private bool SoundOn3 => (memory[0xff1a] & 0x7) != 0;
-        private int Length3 => 256 - memory[0xff1b];
-        private int lengthPlayed3 = 0;
-        private int OutputLevel3 => (memory[0xff1c] & 0x60) >> 5;
-        private bool TriggerSound3 => (memory[0xff1e] >> 7) != 0;
-        private int Frequency3 => (memory[0xff1e] & 7) << 8 | memory[0xff1d];        
-        private bool Loop3 => (memory[0xff1e] & 0x40) == 0;
-        private int WaveRamStart = 0xff30;
-        private int[] Samples => new[]
-        {
-            memory[WaveRamStart] >> 4, memory[WaveRamStart] & 0xF,
-            memory[WaveRamStart + 1] >> 4, memory[WaveRamStart + 1] & 0xF,
-            memory[WaveRamStart + 2] >> 4, memory[WaveRamStart + 2] & 0xF,
-            memory[WaveRamStart + 3] >> 4, memory[WaveRamStart + 3] & 0xF,
-            memory[WaveRamStart + 4] >> 4, memory[WaveRamStart + 4] & 0xF,
-            memory[WaveRamStart + 5] >> 4, memory[WaveRamStart + 5] & 0xF,
-            memory[WaveRamStart + 6] >> 4, memory[WaveRamStart + 6] & 0xF,
-            memory[WaveRamStart + 7] >> 4, memory[WaveRamStart + 7] & 0xF,
-            memory[WaveRamStart + 8] >> 4, memory[WaveRamStart + 8] & 0xF,
-            memory[WaveRamStart + 9] >> 4, memory[WaveRamStart + 9] & 0xF,
-            memory[WaveRamStart + 10] >> 4, memory[WaveRamStart + 10] & 0xF,
-            memory[WaveRamStart + 11] >> 4, memory[WaveRamStart + 11] & 0xF,
-            memory[WaveRamStart + 12] >> 4, memory[WaveRamStart + 12] & 0xF,
-            memory[WaveRamStart + 13] >> 4, memory[WaveRamStart + 13] & 0xF,
-            memory[WaveRamStart + 14] >> 4, memory[WaveRamStart + 14] & 0xF,
-            memory[WaveRamStart + 15] >> 4, memory[WaveRamStart + 15] & 0xF,
-        };
-        
-        public void StartSound3()
-        {
-            if (TriggerSound3)
-            {
-                signal3 = new GBSignalGenerator(SampleRate, NumChannels)
-                {
-                    Channel = GBSignalGenerator.ChannelType.Samples,
-                    Frequency = Frequency3,
-                    Samples = Samples,
-                    OutputShift = Pattern2Shift(OutputLevel3)
-                };
-
-                SetSound3On();
-            }
-        }
-
-        private int Pattern2Shift(int outputLevel)
-        {
-            switch (outputLevel)
-            {
-                case 0: return 4;
-                case 1: return 0;
-                case 2: return 1;
-                case 3: return 2;
-                default: throw new Exception("Invalid output level");
-            }
-        }
-        
-        private void SetSound3On()
-        {
-            lengthPlayed3 = 0;
-            OnOff = (byte) (OnOff | 0x04);
-        }
-
-        private void SetSound3Off()
-        {
-            OnOff = (byte) (OnOff & 0xFB);      // 11111011
-            lengthPlayed3 = 0;
-            signal3 = null;
-        }
-        
-        #endregion
-
-        #region Sound4
-
-        private GBSignalGenerator signal4;
-        private BufferedWaveProvider waveBuffer4;
-        private int Length4 => (64 - (memory[0xff20] & 0x3F)) * 4;
-        private int lengthPlayed4 = 0;
-        private byte Envelope4 => memory[0xff21];
-        private double Volume4 => (Envelope4 >> 4) / 15.0;
-        private bool EnvelopeAmplify4 => (Envelope4 & 0x8) != 0;
-        private int EnvelopePeriod4 => (Envelope4 & 0x7);
-        private byte PolynomialCounter => memory[0xff22];
-        private int CounterShift => (PolynomialCounter >> 4);
-        private bool CounterWidthMode => (PolynomialCounter & 8) != 0;
-        private int CounterDividingRatio => (PolynomialCounter & 7);
-        private bool TriggerSound4 => (memory[0xff23] >> 7) != 0;
-        private bool Loop4 => (memory[0xff23] & 0x40) == 0;
-
-        public void StartSound4()
-        {
-            if (TriggerSound4)
-            {
-                signal4 = new GBSignalGenerator(SampleRate, NumChannels)
-                {
-                    Channel = GBSignalGenerator.ChannelType.Noise,
-                    Gain = Volume4,
-                    CounterShift = CounterShift,
-                    CounterWidthMode = CounterWidthMode,
-                    CounterDivisor = CounterDividingRatio,
-                    EnvelopeAmplify = EnvelopeAmplify4,
-                    EnvelopePeriod = EnvelopePeriod4,
-                };
-
-                SetSound4On();
-            }
-        }
-        
-        private void SetSound4On()
-        {
-            lengthPlayed4 = 0;
-            OnOff = (byte) (OnOff | 0x08);
-        }
-
-        private void SetSound4Off()
-        {
-            OnOff = (byte) (OnOff & 0xF7);      // 11110111
-            lengthPlayed4 = 0;
-            signal4 = null;
-        }
-        
-        #endregion
-        
         public Sound(Memory memory)
         {
             this.memory = memory;
 
-            waveBuffer1 = new BufferedWaveProvider(WaveFormat.CreateIeeeFloatWaveFormat(SampleRate,NumChannels));
-            waveBuffer2 = new BufferedWaveProvider(WaveFormat.CreateIeeeFloatWaveFormat(SampleRate,NumChannels));
-            waveBuffer3 = new BufferedWaveProvider(WaveFormat.CreateIeeeFloatWaveFormat(SampleRate,NumChannels));
-            waveBuffer4 = new BufferedWaveProvider(WaveFormat.CreateIeeeFloatWaveFormat(SampleRate,NumChannels));
-            waveBuffer1.BufferDuration = TimeSpan.FromMilliseconds( TargetBufferMs * 3 );
-            waveBuffer2.BufferDuration = TimeSpan.FromMilliseconds( TargetBufferMs * 3 );
-            waveBuffer3.BufferDuration = TimeSpan.FromMilliseconds( TargetBufferMs * 3 );
-            waveBuffer4.BufferDuration = TimeSpan.FromMilliseconds( TargetBufferMs * 3 );
-            waveBuffer1.DiscardOnBufferOverflow = true;
-            waveBuffer2.DiscardOnBufferOverflow = true;
-            waveBuffer3.DiscardOnBufferOverflow = true;
-            waveBuffer4.DiscardOnBufferOverflow = true;
-            waveBuffer1.ReadFully = false;
-            waveBuffer2.ReadFully = false;
-            waveBuffer3.ReadFully = false;
-            waveBuffer4.ReadFully = false;
+            channel1 = new SquareChannel(memory, 0xff10, 0xff11, 0xff12, 0xff13, 0xff14, hasSweep: true);
+            channel2 = new SquareChannel(memory, 0x0000, 0xff16, 0xff17, 0xff18, 0xff19, hasSweep: false);
+            channel3 = new WaveChannel(memory);
+            channel4 = new NoiseChannel(memory);
 
             SetSoundOutput();
         }
 
+        // Called from Memory when a trigger register (NRx4) is written. We only latch the intent
+        // here; the actual channel restart happens on the audio thread so envelope/sweep/length
+        // stay coherent with sample generation.
+        public void StartSound1() { if ((memory[0xff14] & 0x80) != 0) trigger1 = true; }
+        public void StartSound2() { if ((memory[0xff19] & 0x80) != 0) trigger2 = true; }
+        public void StartSound3() { if ((memory[0xff1e] & 0x80) != 0) trigger3 = true; }
+        public void StartSound4() { if ((memory[0xff23] & 0x80) != 0) trigger4 = true; }
+
         public void SetSoundOutput()
         {
-            mixer = new SoundMixer(this);
-
             waveOut?.Stop();
             waveOut?.Dispose();
 
-            waveOut = CreateSoundPlayer(mixer);
+            waveOut = CreateSoundPlayer(new ApuProvider(this));
+            waveOut.Play();
         }
 
-        private IWavePlayer CreateSoundPlayer(IWaveProvider waveProvider)
+        // Kept alive by a periodic call from the emulator thread: the initial Play() in the
+        // constructor can run before the device is ready, and this revives it if the backend ever
+        // drops out. It is a cheap no-op once the device is already playing.
+        public void EnsurePlaying()
         {
-            if (TryCreateSoundPlayer(CreateWaveOutPlayer, waveProvider, "WaveOut", out var player))
+            var device = waveOut;
+            if (device != null && device.PlaybackState != PlaybackState.Playing)
+                device.Play();
+        }
+
+        // Release the output device on shutdown. Without this the backend's playback thread can keep
+        // the process (and the sound device) alive, so repeated runs progressively lock out audio.
+        public void Stop()
+        {
+            var device = waveOut;
+            waveOut = null;
+            device?.Stop();
+            device?.Dispose();
+        }
+
+        #region Mixing / frame sequencer (audio thread)
+
+        private void NextFrame(out float left, out float right)
+        {
+            ApplyPendingTriggers();
+            StepFrameSequencer();
+
+            bool powerOn = (memory[0xff26] & 0x80) != 0;
+            if (!powerOn)
+            {
+                channel1.Disable();
+                channel2.Disable();
+                channel3.Disable();
+                channel4.Disable();
+                left = right = 0f;
+                return;
+            }
+
+            float s1 = channel1.NextSample();
+            float s2 = channel2.NextSample();
+            float s3 = channel3.NextSample();
+            float s4 = channel4.NextSample();
+
+            // NR51: low nibble routes to the left mix, high nibble to the right mix.
+            int routing = memory[0xff25];
+            float leftMix =
+                ((routing & 0x01) != 0 ? s1 : 0f) +
+                ((routing & 0x02) != 0 ? s2 : 0f) +
+                ((routing & 0x04) != 0 ? s3 : 0f) +
+                ((routing & 0x08) != 0 ? s4 : 0f);
+            float rightMix =
+                ((routing & 0x10) != 0 ? s1 : 0f) +
+                ((routing & 0x20) != 0 ? s2 : 0f) +
+                ((routing & 0x40) != 0 ? s3 : 0f) +
+                ((routing & 0x80) != 0 ? s4 : 0f);
+
+            // NR50: master volume per side (0-7), no relation to Vin here.
+            int control = memory[0xff24];
+            float leftGain = ((control & 0x07) + 1) / 8.0f;
+            float rightGain = (((control >> 4) & 0x07) + 1) / 8.0f;
+
+            // Divide by the channel count so four simultaneous full-scale channels cannot clip.
+            left = Clamp(leftMix * leftGain * 0.25f);
+            right = Clamp(rightMix * rightGain * 0.25f);
+        }
+
+        private void ApplyPendingTriggers()
+        {
+            if (trigger1) { trigger1 = false; channel1.Trigger(); }
+            if (trigger2) { trigger2 = false; channel2.Trigger(); }
+            if (trigger3) { trigger3 = false; channel3.Trigger(); }
+            if (trigger4) { trigger4 = false; channel4.Trigger(); }
+        }
+
+        private void StepFrameSequencer()
+        {
+            frameSequencerAccumulator += FrameSequencerHz / SampleRate;
+            if (frameSequencerAccumulator < 1.0)
+                return;
+
+            frameSequencerAccumulator -= 1.0;
+            frameSequencerStep = (frameSequencerStep + 1) & 7;
+
+            // 512 Hz sequencer: length @256 Hz (even steps), sweep @128 Hz (2,6), envelope @64 Hz (7).
+            if ((frameSequencerStep & 1) == 0)
+            {
+                channel1.ClockLength();
+                channel2.ClockLength();
+                channel3.ClockLength();
+                channel4.ClockLength();
+            }
+            if (frameSequencerStep == 2 || frameSequencerStep == 6)
+                channel1.ClockSweep();
+            if (frameSequencerStep == 7)
+            {
+                channel1.ClockEnvelope();
+                channel2.ClockEnvelope();
+                channel4.ClockEnvelope();
+            }
+        }
+
+        // Reflect channel on/off state back into NR52 so games that poll it for sequencing work.
+        private void UpdateStatusRegister()
+        {
+            int status = memory[0xff26] & 0x80;
+            status |= 0x70;                     // unused bits read as 1
+            if (channel1.Enabled) status |= 0x01;
+            if (channel2.Enabled) status |= 0x02;
+            if (channel3.Enabled) status |= 0x04;
+            if (channel4.Enabled) status |= 0x08;
+            memory[0xff26] = (byte) status;
+        }
+
+        private static float Clamp(float value)
+        {
+            if (value > 1.0f) return 1.0f;
+            if (value < -1.0f) return -1.0f;
+            return value;
+        }
+
+        #endregion
+
+        #region Output device
+
+        private sealed class ApuProvider : ISampleProvider
+        {
+            private readonly Sound sound;
+
+            public ApuProvider(Sound sound)
+            {
+                this.sound = sound;
+                WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(SampleRate, NumChannels);
+            }
+
+            public WaveFormat WaveFormat { get; }
+
+            public int Read(float[] buffer, int offset, int count)
+            {
+                for (int i = 0; i < count; i += 2)
+                {
+                    sound.NextFrame(out float left, out float right);
+                    buffer[offset + i] = left;
+                    buffer[offset + i + 1] = right;
+                }
+                sound.UpdateStatusRegister();
+                return count;
+            }
+        }
+
+        private IWavePlayer CreateSoundPlayer(ISampleProvider provider)
+        {
+            // Convert to 16-bit PCM: this is the format Windows sound backends accept most reliably
+            // (raw IEEE-float can be silently rejected by some drivers). DirectSound first because it
+            // was the path that worked previously on this setup.
+            var floatProvider = provider.ToWaveProvider();
+            var pcm16 = provider.ToWaveProvider16();
+
+            // Plain WaveOut (window-callback winmm) first: it was the audible backend previously on
+            // this setup. WaveOutEvent (event-callback) failed waveOutOpen here, and DirectSound
+            // pulls samples but is silent, so both are later fallbacks.
+            if (TryCreatePlayer(() => new WaveOut { DesiredLatency = DesiredLatency }, floatProvider, "WaveOut float", out var player))
                 return player;
-
-            var standardWaveProvider = CreateStandardOutputProvider(waveProvider);
-
-            if (TryCreateSoundPlayer(CreateDirectSoundPlayer, standardWaveProvider, "DirectSound standard PCM", out player))
+            if (TryCreatePlayer(() => new WaveOut { DesiredLatency = DesiredLatency }, pcm16, "WaveOut PCM16", out player))
                 return player;
-
-            if (TryCreateSoundPlayer(CreateWaveOutPlayer, standardWaveProvider, "WaveOut standard PCM", out player))
+            if (TryCreatePlayer(() => new WasapiOut(AudioClientShareMode.Shared, 100), floatProvider, "WASAPI shared float", out player))
                 return player;
-
-            if (TryCreateSoundPlayer(() => new WaveOutEvent { DesiredLatency = DesiredLatency }, standardWaveProvider, "WaveOutEvent standard PCM", out player))
+            if (TryCreatePlayer(() => new WaveOutEvent { DesiredLatency = DesiredLatency }, pcm16, "WaveOutEvent PCM16", out player))
+                return player;
+            if (TryCreatePlayer(() => new DirectSoundOut(DesiredLatency), pcm16, "DirectSound PCM16", out player))
                 return player;
 
             throw new InvalidOperationException("No compatible sound output could be initialized.");
         }
 
-        private WaveOut CreateWaveOutPlayer()
-        {
-            return new WaveOut
-            {
-                DesiredLatency = DesiredLatency
-            };
-        }
-
-        private DirectSoundOut CreateDirectSoundPlayer()
-        {
-            return new DirectSoundOut(DesiredLatency);
-        }
-
-        private IWaveProvider CreateStandardOutputProvider(IWaveProvider waveProvider)
-        {
-            var resampledProvider = new WdlResamplingSampleProvider(waveProvider.ToSampleProvider(), 48000);
-            return resampledProvider.ToWaveProvider16();
-        }
-
-        private bool TryCreateSoundPlayer(Func<IWavePlayer> playerFactory, IWaveProvider waveProvider, string name, out IWavePlayer player)
+        private static bool TryCreatePlayer(Func<IWavePlayer> factory, IWaveProvider provider, string name, out IWavePlayer player)
         {
             player = null;
-
             try
             {
-                player = playerFactory();
-                player.Init(waveProvider);
+                player = factory();
+                player.Init(provider);
                 return true;
             }
             catch (Exception exception)
@@ -393,137 +266,323 @@ namespace ZarthGB
             }
         }
 
-        private class SoundMixer : IWaveProvider
+        #endregion
+
+        #region Channels
+
+        // Pulse channels 1 (with frequency sweep) and 2. Frequency is expressed as the GB 11-bit
+        // period value; the audible tone is 131072 / (2048 - freq) Hz, stepped through an 8-entry
+        // duty pattern.
+        private sealed class SquareChannel
         {
-            private readonly Sound sound;
-            private byte[] sound1Buffer = Array.Empty<byte>();
-            private byte[] sound2Buffer = Array.Empty<byte>();
-            private byte[] sound3Buffer = Array.Empty<byte>();
-            private byte[] sound4Buffer = Array.Empty<byte>();
-
-            public SoundMixer(Sound sound)
+            private static readonly byte[][] DutyTable =
             {
-                this.sound = sound;
-                WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(SampleRate, 2);
+                new byte[] {0, 0, 0, 0, 0, 0, 0, 1},   // 12.5%
+                new byte[] {1, 0, 0, 0, 0, 0, 0, 1},   // 25%
+                new byte[] {1, 0, 0, 0, 0, 1, 1, 1},   // 50%
+                new byte[] {0, 1, 1, 1, 1, 1, 1, 0},   // 75%
+            };
+
+            private readonly Memory memory;
+            private readonly int nr0, nr1, nr2, nr3, nr4;
+            private readonly bool hasSweep;
+
+            private double phase;
+            private int dutyPosition;
+            private int volume;
+            private int envelopeTimer;
+            private int lengthCounter;
+
+            private int shadowFrequency;
+            private int sweepTimer;
+            private bool sweepEnabled;
+            private bool useShadowFrequency;
+
+            public bool Enabled { get; private set; }
+
+            public SquareChannel(Memory memory, int nr0, int nr1, int nr2, int nr3, int nr4, bool hasSweep)
+            {
+                this.memory = memory;
+                this.nr0 = nr0;
+                this.nr1 = nr1;
+                this.nr2 = nr2;
+                this.nr3 = nr3;
+                this.nr4 = nr4;
+                this.hasSweep = hasSweep;
             }
 
-            public WaveFormat WaveFormat { get; }
+            private bool DacOn => (memory[nr2] & 0xF8) != 0;
+            private int RegisterFrequency => ((memory[nr4] & 0x07) << 8) | memory[nr3];
 
-            public int Read(byte[] buffer, int offset, int count)
+            public void Disable() => Enabled = false;
+
+            public void Trigger()
             {
-                Array.Clear(buffer, offset, count);
+                Enabled = DacOn;
+                lengthCounter = 64 - (memory[nr1] & 0x3F);
+                volume = memory[nr2] >> 4;
+                int period = memory[nr2] & 0x07;
+                envelopeTimer = period == 0 ? 8 : period;
 
-                int sampleFrames = count / WaveFormat.BlockAlign;
-                int monoBytes = sampleFrames * sizeof(float);
-
-                EnsureBuffer(ref sound1Buffer, monoBytes);
-                EnsureBuffer(ref sound2Buffer, monoBytes);
-                EnsureBuffer(ref sound3Buffer, monoBytes);
-                EnsureBuffer(ref sound4Buffer, monoBytes);
-
-                int sound1Bytes = sound.waveBuffer1.Read(sound1Buffer, 0, monoBytes);
-                int sound2Bytes = sound.waveBuffer2.Read(sound2Buffer, 0, monoBytes);
-                int sound3Bytes = sound.waveBuffer3.Read(sound3Buffer, 0, monoBytes);
-                int sound4Bytes = sound.waveBuffer4.Read(sound4Buffer, 0, monoBytes);
-
-                for (int frame = 0; frame < sampleFrames; frame++)
+                if (hasSweep)
                 {
-                    int monoOffset = frame * sizeof(float);
-                    float left = 0.0f;
-                    float right = 0.0f;
-
-                    AddSample(sound1Buffer, sound1Bytes, monoOffset, sound.Sound1ToLeft, sound.Sound1ToRight, ref left, ref right);
-                    AddSample(sound2Buffer, sound2Bytes, monoOffset, sound.Sound2ToLeft, sound.Sound2ToRight, ref left, ref right);
-                    AddSample(sound3Buffer, sound3Bytes, monoOffset, sound.Sound3ToLeft, sound.Sound3ToRight, ref left, ref right);
-                    AddSample(sound4Buffer, sound4Bytes, monoOffset, sound.Sound4ToLeft, sound.Sound4ToRight, ref left, ref right);
-
-                    int outputOffset = offset + (frame * WaveFormat.BlockAlign);
-                    WriteFloat(buffer, outputOffset, left);
-                    WriteFloat(buffer, outputOffset + sizeof(float), right);
+                    shadowFrequency = RegisterFrequency;
+                    int sweepPeriod = (memory[nr0] >> 4) & 0x07;
+                    int sweepShift = memory[nr0] & 0x07;
+                    sweepTimer = sweepPeriod == 0 ? 8 : sweepPeriod;
+                    sweepEnabled = sweepPeriod > 0 || sweepShift > 0;
+                    useShadowFrequency = sweepEnabled;
+                    if (sweepShift > 0)
+                        CalculateSweepFrequency();     // immediate overflow check on trigger
                 }
-
-                return count;
             }
 
-            private static void EnsureBuffer(ref byte[] buffer, int length)
+            public void ClockLength()
             {
-                if (buffer.Length < length)
-                    buffer = new byte[length];
+                if ((memory[nr4] & 0x40) != 0 && lengthCounter > 0)
+                {
+                    lengthCounter--;
+                    if (lengthCounter == 0)
+                        Enabled = false;
+                }
             }
 
-            private static void AddSample(byte[] buffer, int bytesRead, int offset, bool toLeft, bool toRight, ref float left, ref float right)
+            public void ClockEnvelope()
             {
-                if (offset + sizeof(float) > bytesRead)
+                int period = memory[nr2] & 0x07;
+                if (period == 0)
                     return;
 
-                float sample = BitConverter.ToSingle(buffer, offset);
+                if (envelopeTimer > 0)
+                    envelopeTimer--;
+                if (envelopeTimer != 0)
+                    return;
 
-                if (toLeft)
-                    left += sample;
-
-                if (toRight)
-                    right += sample;
+                envelopeTimer = period;
+                bool amplify = (memory[nr2] & 0x08) != 0;
+                if (amplify && volume < 15) volume++;
+                else if (!amplify && volume > 0) volume--;
             }
 
-            private static void WriteFloat(byte[] buffer, int offset, float value)
+            public void ClockSweep()
             {
-                byte[] bytes = BitConverter.GetBytes(Math.Clamp(value, -1.0f, 1.0f));
-                Buffer.BlockCopy(bytes, 0, buffer, offset, bytes.Length);
+                if (!hasSweep)
+                    return;
+
+                int period = (memory[nr0] >> 4) & 0x07;
+                if (sweepTimer > 0)
+                    sweepTimer--;
+                if (sweepTimer != 0)
+                    return;
+
+                sweepTimer = period == 0 ? 8 : period;
+                if (!sweepEnabled || period == 0)
+                    return;
+
+                int newFrequency = CalculateSweepFrequency();
+                int shift = memory[nr0] & 0x07;
+                if (newFrequency <= 2047 && shift > 0)
+                {
+                    shadowFrequency = newFrequency;
+                    CalculateSweepFrequency();         // second overflow check
+                }
+            }
+
+            private int CalculateSweepFrequency()
+            {
+                int shift = memory[nr0] & 0x07;
+                bool negate = (memory[nr0] & 0x08) != 0;
+                int delta = shadowFrequency >> shift;
+                int newFrequency = negate ? shadowFrequency - delta : shadowFrequency + delta;
+                if (newFrequency > 2047)
+                    Enabled = false;
+                return newFrequency;
+            }
+
+            public float NextSample()
+            {
+                if (!Enabled || !DacOn)
+                    return 0f;
+
+                int frequency = useShadowFrequency ? shadowFrequency : RegisterFrequency;
+                if (frequency >= 2048)
+                    return 0f;
+
+                double toneHz = 131072.0 / (2048 - frequency);
+                phase += toneHz * 8.0 / SampleRate;
+                while (phase >= 1.0)
+                {
+                    phase -= 1.0;
+                    dutyPosition = (dutyPosition + 1) & 7;
+                }
+
+                int duty = memory[nr1] >> 6;
+                float amplitude = volume / 15.0f;
+                return DutyTable[duty][dutyPosition] != 0 ? amplitude : -amplitude;
             }
         }
 
-        public void Play()
+        // Wave channel 3: plays the 32 4-bit samples in wave RAM (0xFF30-0xFF3F) at
+        // 65536 / (2048 - freq) Hz, attenuated by the NR32 output level.
+        private sealed class WaveChannel
         {
-            // The output device drains each channel's BufferedWaveProvider at the real playback
-            // rate. We only ever refill each one back up to TargetBufferMs, so the amount of audio
-            // synthesized per call self-throttles to match actual consumption. That removes both
-            // failure modes of the old approach: overproduction (which overflowed the buffers and
-            // silently discarded samples -> skips) and starvation (empty buffers -> gaps/clicks).
-            TopUpChannel(signal1, waveBuffer1, Loop1, Length1, ref lengthPlayed1, SetSound1Off);
-            TopUpChannel(signal2, waveBuffer2, Loop2, Length2, ref lengthPlayed2, SetSound2Off);
-            TopUpChannel(signal3, waveBuffer3, Loop3, Length3, ref lengthPlayed3, SetSound3Off);
-            TopUpChannel(signal4, waveBuffer4, Loop4, Length4, ref lengthPlayed4, SetSound4Off);
+            private readonly Memory memory;
+            private double phase;
+            private int position;
+            private int lengthCounter;
 
-            // Keep the device running continuously. Unlike the old code we never Stop() it and never
-            // gate the start behind a warm-up delay -- when all channels are idle the mixer simply
-            // emits silence -- so a short sound effect can never miss the window while the output
-            // device is still spinning up. The check is a cheap no-op once it is already playing,
-            // and revives it if the backend ever drops out.
-            if (waveOut.PlaybackState != PlaybackState.Playing)
-                waveOut.Play();
+            public bool Enabled { get; private set; }
 
-            if (!Sound1On) SetSound1Off();
-            if (!Sound2On) SetSound2Off();
-            if (!Sound3On || !SoundOn3) SetSound3Off();
-            if (!Sound4On) SetSound4Off();
+            public WaveChannel(Memory memory) => this.memory = memory;
+
+            private bool DacOn => (memory[0xff1a] & 0x80) != 0;
+            private int RegisterFrequency => ((memory[0xff1e] & 0x07) << 8) | memory[0xff1d];
+
+            public void Disable() => Enabled = false;
+
+            public void Trigger()
+            {
+                Enabled = DacOn;
+                lengthCounter = 256 - memory[0xff1b];
+                position = 0;
+                phase = 0;
+            }
+
+            public void ClockLength()
+            {
+                if ((memory[0xff1e] & 0x40) != 0 && lengthCounter > 0)
+                {
+                    lengthCounter--;
+                    if (lengthCounter == 0)
+                        Enabled = false;
+                }
+            }
+
+            public void ClockEnvelope() { }   // no envelope on the wave channel
+            public void ClockSweep() { }
+
+            public float NextSample()
+            {
+                if (!Enabled || !DacOn)
+                    return 0f;
+
+                int outputLevel = (memory[0xff1c] >> 5) & 0x03;
+                if (outputLevel == 0)
+                    return 0f;                 // muted
+
+                int frequency = RegisterFrequency;
+                if (frequency >= 2048)
+                    return 0f;
+
+                double sampleHz = 65536.0 / (2048 - frequency);
+                phase += sampleHz * 32.0 / SampleRate;
+                while (phase >= 1.0)
+                {
+                    phase -= 1.0;
+                    position = (position + 1) & 31;
+                }
+
+                int packed = memory[0xff30 + (position >> 1)];
+                int nibble = (position & 1) == 0 ? (packed >> 4) : (packed & 0x0F);
+                int shift = outputLevel - 1;   // 1->0 (full), 2->1 (half), 3->2 (quarter)
+                int digital = nibble >> shift;
+                return (float) (digital / 7.5 - 1.0);
+            }
         }
 
-        private void TopUpChannel(GBSignalGenerator signal, BufferedWaveProvider buffer,
-            bool loop, int length, ref int lengthPlayed, Action turnOff)
+        // Noise channel 4: a 15/7-bit LFSR clocked at 4194304 / (divisor << shift) Hz.
+        private sealed class NoiseChannel
         {
-            if (signal == null)
+            private static readonly int[] Divisors = {8, 16, 32, 48, 64, 80, 96, 112};
+
+            private readonly Memory memory;
+            private double phase;
+            private ushort lfsr = 0x7FFF;
+            private int volume;
+            private int envelopeTimer;
+            private int lengthCounter;
+
+            public bool Enabled { get; private set; }
+
+            public NoiseChannel(Memory memory) => this.memory = memory;
+
+            private bool DacOn => (memory[0xff21] & 0xF8) != 0;
+
+            public void Disable() => Enabled = false;
+
+            public void Trigger()
             {
-                turnOff();
-                return;
+                Enabled = DacOn;
+                lengthCounter = 64 - (memory[0xff20] & 0x3F);
+                volume = memory[0xff21] >> 4;
+                int period = memory[0xff21] & 0x07;
+                envelopeTimer = period == 0 ? 8 : period;
+                lfsr = 0x7FFF;
             }
 
-            // Generate just enough to refill the queue; the generator keeps its phase across calls,
-            // so successive top-ups stay continuous. Non-looping sounds are clamped to the length
-            // counter and stop once it is exhausted.
-            int playLength = TargetBufferMs - (int)buffer.BufferedDuration.TotalMilliseconds;
-            if (!loop)
-                playLength = Math.Min(playLength, length - lengthPlayed);
-
-            if (playLength > 0)
+            public void ClockLength()
             {
-                var bytes = new byte[buffer.WaveFormat.AverageBytesPerSecond * playLength / 1000];
-                int read = signal.Take(TimeSpan.FromMilliseconds(playLength)).ToWaveProvider().Read(bytes, 0, bytes.Length);
-                buffer.AddSamples(bytes, 0, read);
-                lengthPlayed += playLength;
+                if ((memory[0xff23] & 0x40) != 0 && lengthCounter > 0)
+                {
+                    lengthCounter--;
+                    if (lengthCounter == 0)
+                        Enabled = false;
+                }
             }
 
-            if (!loop && lengthPlayed >= length)
-                turnOff();
+            public void ClockEnvelope()
+            {
+                int period = memory[0xff21] & 0x07;
+                if (period == 0)
+                    return;
+
+                if (envelopeTimer > 0)
+                    envelopeTimer--;
+                if (envelopeTimer != 0)
+                    return;
+
+                envelopeTimer = period;
+                bool amplify = (memory[0xff21] & 0x08) != 0;
+                if (amplify && volume < 15) volume++;
+                else if (!amplify && volume > 0) volume--;
+            }
+
+            public void ClockSweep() { }
+
+            public float NextSample()
+            {
+                if (!Enabled || !DacOn)
+                    return 0f;
+
+                int register = memory[0xff22];
+                int shift = register >> 4;
+                if (shift >= 14)                   // shifts 14/15 are invalid: the LFSR never clocks
+                    return 0f;
+
+                int divisorCode = register & 0x07;
+                bool widthMode = (register & 0x08) != 0;
+                double clockHz = (double) CpuFrequency / (Divisors[divisorCode] << shift);
+
+                phase += clockHz / SampleRate;
+                while (phase >= 1.0)
+                {
+                    phase -= 1.0;
+                    StepLfsr(widthMode);
+                }
+
+                float amplitude = volume / 15.0f;
+                return (lfsr & 0x01) == 0 ? amplitude : -amplitude;
+            }
+
+            private void StepLfsr(bool widthMode)
+            {
+                int xor = (lfsr ^ (lfsr >> 1)) & 1;
+                lfsr = (ushort) ((lfsr >> 1) | (xor << 14));
+                if (widthMode)
+                    lfsr = (ushort) ((lfsr & ~0x40) | (xor << 6));
+            }
         }
+
+        #endregion
     }
 }
