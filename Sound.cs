@@ -17,15 +17,17 @@ namespace ZarthGB
         public const int PlayStep = 16;  // In ms
         public const int DesiredLatency = 160;      // PS 8 -> DL 156
 
+        // How much audio we try to keep queued per channel. The output device drains these
+        // buffers at the true playback rate; each Play() only tops them back up to this level,
+        // so the amount synthesized is paced by real consumption (feedback loop) rather than by
+        // guessing elapsed time. Must comfortably exceed one device read to avoid underruns.
+        private const int TargetBufferMs = DesiredLatency;
+
         private Memory memory;
         private const int SampleRate = 192000;    // Minimum 192kHz to get enough frequency resolution -else sounds distorted
         private const int NumChannels = 1;
-        private Stopwatch stopwatch = new Stopwatch();
-        private TimeSpan lastTime;
         private IWaveProvider mixer;
         private IWavePlayer waveOut;
-        private int buffering;
-        private const int BufferingRounds = 4;
         
         private byte ChannelControl => memory[0xff24];
         private int RightVolume => (ChannelControl >> 4) & 7;
@@ -57,7 +59,6 @@ namespace ZarthGB
         #region Sound1
         private GBSignalGenerator signal1;
         private BufferedWaveProvider waveBuffer1;
-        private Dictionary<string, byte[]> bufferCache1 = new Dictionary<string, byte[]>();
         private byte Sweep1 => memory[0xff10];
         private int SweepShift => Sweep1 & 0x7; 
         private bool SweepAmplify => (Sweep1 & 0x8) == 0;
@@ -131,7 +132,6 @@ namespace ZarthGB
         #region Sound2
         private GBSignalGenerator signal2;
         private BufferedWaveProvider waveBuffer2;
-        private Dictionary<string, byte[]> bufferCache2 = new Dictionary<string, byte[]>();
         private byte WaveLength2 => memory[0xff16];
         private int WaveDuty2 => WaveLength2 >> 6;
         private int Length2 => (64 - (WaveLength2 & 0x3F)) * 4;
@@ -180,7 +180,6 @@ namespace ZarthGB
         #region Sound3
         private GBSignalGenerator signal3;
         private BufferedWaveProvider waveBuffer3;
-        private Dictionary<string, byte[]> bufferCache3 = new Dictionary<string, byte[]>();
         private bool SoundOn3 => (memory[0xff1a] & 0x7) != 0;
         private int Length3 => 256 - memory[0xff1b];
         private int lengthPlayed3 = 0;
@@ -256,7 +255,6 @@ namespace ZarthGB
 
         private GBSignalGenerator signal4;
         private BufferedWaveProvider waveBuffer4;
-        private Dictionary<string, byte[]> bufferCache4 = new Dictionary<string, byte[]>();
         private int Length4 => (64 - (memory[0xff20] & 0x3F)) * 4;
         private int lengthPlayed4 = 0;
         private byte Envelope4 => memory[0xff21];
@@ -307,16 +305,15 @@ namespace ZarthGB
         public Sound(Memory memory)
         {
             this.memory = memory;
-            Reset();
 
             waveBuffer1 = new BufferedWaveProvider(WaveFormat.CreateIeeeFloatWaveFormat(SampleRate,NumChannels));
             waveBuffer2 = new BufferedWaveProvider(WaveFormat.CreateIeeeFloatWaveFormat(SampleRate,NumChannels));
             waveBuffer3 = new BufferedWaveProvider(WaveFormat.CreateIeeeFloatWaveFormat(SampleRate,NumChannels));
             waveBuffer4 = new BufferedWaveProvider(WaveFormat.CreateIeeeFloatWaveFormat(SampleRate,NumChannels));
-            waveBuffer1.BufferDuration = TimeSpan.FromMilliseconds( PlayStep * 10 );
-            waveBuffer2.BufferDuration = TimeSpan.FromMilliseconds( PlayStep * 10 );
-            waveBuffer3.BufferDuration = TimeSpan.FromMilliseconds( PlayStep * 10 );
-            waveBuffer4.BufferDuration = TimeSpan.FromMilliseconds( PlayStep * 10 );
+            waveBuffer1.BufferDuration = TimeSpan.FromMilliseconds( TargetBufferMs * 3 );
+            waveBuffer2.BufferDuration = TimeSpan.FromMilliseconds( TargetBufferMs * 3 );
+            waveBuffer3.BufferDuration = TimeSpan.FromMilliseconds( TargetBufferMs * 3 );
+            waveBuffer4.BufferDuration = TimeSpan.FromMilliseconds( TargetBufferMs * 3 );
             waveBuffer1.DiscardOnBufferOverflow = true;
             waveBuffer2.DiscardOnBufferOverflow = true;
             waveBuffer3.DiscardOnBufferOverflow = true;
@@ -327,8 +324,6 @@ namespace ZarthGB
             waveBuffer4.ReadFully = false;
 
             SetSoundOutput();
-            
-            buffering = BufferingRounds;
         }
 
         public void SetSoundOutput()
@@ -477,168 +472,58 @@ namespace ZarthGB
             }
         }
 
-        public void Reset()
-        {
-            stopwatch.Restart();
-        }
-
         public void Play()
         {
-            TimeSpan elapsed = stopwatch.Elapsed - lastTime;
-            lastTime = stopwatch.Elapsed;
-            int playStep = elapsed.Milliseconds << 1;
-            
-            Debug.Print($"Sound: {playStep} / {PlayStep}, {waveOut.PlaybackState}");
-            Debug.Print($"Buffer1: {waveBuffer1.BufferedDuration.Milliseconds}, Buffer2: {waveBuffer2.BufferedDuration.Milliseconds}, Buffer3: {waveBuffer3.BufferedDuration.Milliseconds}, Buffer4: {waveBuffer4.BufferedDuration.Milliseconds}, ");
-            //Debug.Print($"Sound1On: {Sound1On}, Sound2On: {Sound2On}, Loop1: {Loop1}, Loop2: {Loop2}");
-            
-            if (signal1 != null)
-            {
-                var playLength = (Loop1 || (lengthPlayed1 + playStep) <= Length1) ? playStep : Length1 - lengthPlayed1;
-                if (playLength > 0)
-                {
-                    byte[] buffer;
-                    int bytes;
-                    string key = $"{playLength}-{Frequency1}-{WaveDuty1}-{EnvelopeAmplify1}-{EnvelopePeriod1}-{SweepAmplify}-{SweepPeriod}-{SweepShift}-{Volume1}";
+            // The output device drains each channel's BufferedWaveProvider at the real playback
+            // rate. We only ever refill each one back up to TargetBufferMs, so the amount of audio
+            // synthesized per call self-throttles to match actual consumption. That removes both
+            // failure modes of the old approach: overproduction (which overflowed the buffers and
+            // silently discarded samples -> skips) and starvation (empty buffers -> gaps/clicks).
+            TopUpChannel(signal1, waveBuffer1, Loop1, Length1, ref lengthPlayed1, SetSound1Off);
+            TopUpChannel(signal2, waveBuffer2, Loop2, Length2, ref lengthPlayed2, SetSound2Off);
+            TopUpChannel(signal3, waveBuffer3, Loop3, Length3, ref lengthPlayed3, SetSound3Off);
+            TopUpChannel(signal4, waveBuffer4, Loop4, Length4, ref lengthPlayed4, SetSound4Off);
 
-                    if (!Loop1 && bufferCache1.ContainsKey(key))
-                    {
-                        buffer = bufferCache1[key];
-                        bytes = buffer.Length;
-                    }
-                    else
-                    {
-                        buffer = new byte[waveBuffer1.WaveFormat.AverageBytesPerSecond * playLength / 1000];
-                        var sample = signal1.Take(TimeSpan.FromMilliseconds(playLength));
-                        bytes = sample.ToWaveProvider().Read(buffer, 0, buffer.Length);
-                        bufferCache1[key] = buffer;
-                    }
-                    waveBuffer1.AddSamples(buffer, 0, bytes);
-                    lengthPlayed1 += playLength;
-                    
-                    if (!Loop1) SetSound1Off();
-                }
-                else
-                    SetSound1Off();
-            }
-            else
-                SetSound1Off();
-            
-            if (signal2 != null)
-            {
-                var playLength = (Loop2 || (lengthPlayed2 + playStep) <= Length2) ? playStep : Length2 - lengthPlayed2;
-                if (playLength > 0)
-                {
-                    byte[] buffer;
-                    int bytes;
-                    string key = $"{playLength}-{Frequency2}-{WaveDuty2}-{EnvelopeAmplify2}-{EnvelopePeriod2}-{Volume2}";
-
-                    if (!Loop2 && bufferCache2.ContainsKey(key))
-                    {
-                        buffer = bufferCache2[key];
-                        bytes = buffer.Length;
-                    }
-                    else
-                    {
-                        buffer = new byte[waveBuffer2.WaveFormat.AverageBytesPerSecond * playLength / 1000];
-                        var sample = signal2.Take(TimeSpan.FromMilliseconds(playLength));
-                        bytes = sample.ToWaveProvider().Read(buffer, 0, buffer.Length);
-                        bufferCache2[key] = buffer;
-                    }
-                    waveBuffer2.AddSamples(buffer, 0, bytes);
-                    lengthPlayed2 += playLength;
-                    
-                    if (!Loop2) SetSound2Off();
-                }
-                else
-                    SetSound2Off();
-            }
-            else
-                SetSound2Off();
-            
-            if (signal3 != null)
-            {
-                var playLength = (Loop3 || (lengthPlayed3 + playStep) <= Length3) ? playStep : Length3 - lengthPlayed3;
-                if (playLength > 0)
-                {
-                    byte[] buffer;
-                    int bytes;
-                    string key = $"{playLength}-{Frequency3}-{OutputLevel3}-{Samples.Sum()}";
-    
-                    if (!Loop3 && bufferCache3.ContainsKey(key))
-                    {
-                        buffer = bufferCache3[key];
-                        bytes = buffer.Length;
-                    }
-                    else
-                    {
-                        buffer = new byte[waveBuffer3.WaveFormat.AverageBytesPerSecond * playLength / 1000];
-                        var sample = signal3.Take(TimeSpan.FromMilliseconds(playLength));
-                        bytes = sample.ToWaveProvider().Read(buffer, 0, buffer.Length);
-                        bufferCache3[key] = buffer;
-                    }
-                    waveBuffer3.AddSamples(buffer, 0, bytes);
-                    lengthPlayed3 += playLength;
- 
-                    if (!Loop3) SetSound3Off();
-                }
-                else
-                    SetSound3Off();
-            }
-            else
-                SetSound3Off();
-            
-            if (signal4 != null)
-            {
-                var playLength = (Loop4 || (lengthPlayed4 + playStep) <= Length4) ? playStep : Length4 - lengthPlayed4;
-                if (playLength > 0)
-                {
-                    byte[] buffer;
-                    int bytes;
-                    string key = $"{playLength}-{EnvelopeAmplify4}-{EnvelopePeriod4}-{Volume4}-{CounterShift}-{CounterWidthMode}-{CounterDividingRatio}";
-            
-                    if (!Loop4 && bufferCache4.ContainsKey(key))
-                    {
-                        buffer = bufferCache4[key];
-                        bytes = buffer.Length;
-                    }
-                    else
-                    {
-                        buffer = new byte[waveBuffer4.WaveFormat.AverageBytesPerSecond * playLength / 1000];
-                        var sample = signal4.Take(TimeSpan.FromMilliseconds(playLength));
-                        bytes = sample.ToWaveProvider().Read(buffer, 0, buffer.Length);
-                        bufferCache4[key] = buffer;
-                    }
-                    waveBuffer4.AddSamples(buffer, 0, bytes);
-                    lengthPlayed4 += playLength;
-                    
-                    if (!Loop4) SetSound4Off();
-                }
-                else
-                    SetSound4Off();
-            }
-            else
-                SetSound4Off();
-    
-            //Debug.Print($"Buffer1: {waveBuffer1.BufferedDuration.Milliseconds}, Buffer2: {waveBuffer2.BufferedDuration.Milliseconds}, Buffer3: {waveBuffer3.BufferedDuration.Milliseconds}, Buffer4: {waveBuffer4.BufferedDuration.Milliseconds}, ");
-
+            // Keep the device running continuously. Unlike the old code we never Stop() it and never
+            // gate the start behind a warm-up delay -- when all channels are idle the mixer simply
+            // emits silence -- so a short sound effect can never miss the window while the output
+            // device is still spinning up. The check is a cheap no-op once it is already playing,
+            // and revives it if the backend ever drops out.
             if (waveOut.PlaybackState != PlaybackState.Playing)
-            {
-                if (Sound1On || Sound2On || Sound3On || Sound4On)
-                {
-                    if (buffering > 0)
-                        buffering--; // Give time to the buffers to build up
-                    else
-                        waveOut.Play();
-                }
-                else
-                    buffering = BufferingRounds;
-            }
-            
+                waveOut.Play();
+
             if (!Sound1On) SetSound1Off();
             if (!Sound2On) SetSound2Off();
             if (!Sound3On || !SoundOn3) SetSound3Off();
             if (!Sound4On) SetSound4Off();
+        }
+
+        private void TopUpChannel(GBSignalGenerator signal, BufferedWaveProvider buffer,
+            bool loop, int length, ref int lengthPlayed, Action turnOff)
+        {
+            if (signal == null)
+            {
+                turnOff();
+                return;
+            }
+
+            // Generate just enough to refill the queue; the generator keeps its phase across calls,
+            // so successive top-ups stay continuous. Non-looping sounds are clamped to the length
+            // counter and stop once it is exhausted.
+            int playLength = TargetBufferMs - (int)buffer.BufferedDuration.TotalMilliseconds;
+            if (!loop)
+                playLength = Math.Min(playLength, length - lengthPlayed);
+
+            if (playLength > 0)
+            {
+                var bytes = new byte[buffer.WaveFormat.AverageBytesPerSecond * playLength / 1000];
+                int read = signal.Take(TimeSpan.FromMilliseconds(playLength)).ToWaveProvider().Read(bytes, 0, bytes.Length);
+                buffer.AddSamples(bytes, 0, read);
+                lengthPlayed += playLength;
+            }
+
+            if (!loop && lengthPlayed >= length)
+                turnOff();
         }
     }
 }
