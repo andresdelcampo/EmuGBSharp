@@ -17,7 +17,14 @@ namespace ZarthGB
         const ushort OamBegin = 0xfe00;
 
         Stopwatch stopwatch = new Stopwatch();
-        TimeSpan expectedFrameTime = TimeSpan.FromTicks((long) (TimeSpan.TicksPerSecond / 59.727500569606)) / 2;
+        // Full DMG frame period (~16.75 ms). The sleep in Step() paces one whole frame; the previous
+        // "/ 2" was a hack tuned to Windows' coarse ~15.6 ms Thread.Sleep granularity, which no longer
+        // applies now that Program raises the timer resolution to 1 ms.
+        TimeSpan expectedFrameTime = TimeSpan.FromTicks((long) (TimeSpan.TicksPerSecond / 59.727500569606));
+        // Absolute target for the next frame boundary. Pacing against a running timeline (rather than
+        // restarting the clock each frame) makes small Thread.Sleep overshoots cancel out instead of
+        // accumulating, so the long-term rate stays exact and the audio clock hears no periodic drift.
+        TimeSpan nextFrameTime;
         public bool frameReady = false;
         public bool IsFrameReady
         {
@@ -105,13 +112,10 @@ namespace ZarthGB
                         Scanline++;     // HBlank
                         if(Scanline == 143) 
                         {
-                            if((InterruptEnable & Cpu.InterruptsVblank) > 0) 
+                            if((InterruptEnable & Cpu.InterruptsVblank) > 0)
                                 InterruptFlags |= Cpu.InterruptsVblank;
-                            
-                            TimeSpan ts = stopwatch.Elapsed;
-                            if (ts < expectedFrameTime)
-                                System.Threading.Thread.Sleep(expectedFrameTime - ts);
-                            stopwatch.Restart();
+
+                            PaceFrame();
                             frameReady = true;
 
                             GpuMode = GpuModeEnum.VBlank;
@@ -157,6 +161,36 @@ namespace ZarthGB
                     }
 			
                     break;
+            }
+        }
+
+        // Throttle one emulated frame to real time. Sleeps for the bulk of the wait (cheap, yields
+        // the CPU to the audio thread) then spin-waits the final ~1.5 ms, because Thread.Sleep only
+        // guarantees a *minimum* and jitters. The target advances on a fixed timeline so overshoots
+        // self-correct; if we ever fall more than a frame behind we resync instead of racing to
+        // catch up (which is what produced the periodic "rush").
+        private void PaceFrame()
+        {
+            if (!stopwatch.IsRunning)
+            {
+                stopwatch.Start();
+                nextFrameTime = stopwatch.Elapsed;
+            }
+
+            nextFrameTime += expectedFrameTime;
+
+            TimeSpan remaining = nextFrameTime - stopwatch.Elapsed;
+            if (remaining > TimeSpan.Zero)
+            {
+                TimeSpan spinThreshold = TimeSpan.FromMilliseconds(1.5);
+                if (remaining > spinThreshold)
+                    System.Threading.Thread.Sleep(remaining - spinThreshold);
+                while (stopwatch.Elapsed < nextFrameTime)
+                    System.Threading.Thread.SpinWait(64);
+            }
+            else if (remaining < -expectedFrameTime)
+            {
+                nextFrameTime = stopwatch.Elapsed;
             }
         }
 
