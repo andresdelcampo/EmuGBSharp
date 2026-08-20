@@ -16,8 +16,22 @@ namespace ZarthGB
         const ushort VideoRamBegin = 0x8000;
         const ushort OamBegin = 0xfe00;
 
+        const double FrameRateHz = 59.727500569606;
+        // Full DMG frame period (~16.75 ms), used only by the wall-clock fallback pacer.
+        TimeSpan expectedFrameTime = TimeSpan.FromTicks((long) (TimeSpan.TicksPerSecond / FrameRateHz));
+
+        // Audio-master pacing: emulated audio position vs what the device has actually consumed.
+        const double AudioLeadSeconds = 0.15;   // how far emulation may run ahead of consumption
+        const int AudioStallMs = 600;           // no consumption progress this long => treat device as stalled
+        double emulatedSamples;
+        long pacingLastConsumed;
+        bool audioPacing;
+        bool audioStalled;
+        Stopwatch pacingStall = new Stopwatch();
+
+        // Wall-clock fallback (used only when the audio device is not running).
         Stopwatch stopwatch = new Stopwatch();
-        TimeSpan expectedFrameTime = TimeSpan.FromTicks((long) (TimeSpan.TicksPerSecond / 59.727500569606)) / 2;
+        TimeSpan nextFrameTime;
         public bool frameReady = false;
         public bool IsFrameReady
         {
@@ -105,13 +119,10 @@ namespace ZarthGB
                         Scanline++;     // HBlank
                         if(Scanline == 143) 
                         {
-                            if((InterruptEnable & Cpu.InterruptsVblank) > 0) 
+                            if((InterruptEnable & Cpu.InterruptsVblank) > 0)
                                 InterruptFlags |= Cpu.InterruptsVblank;
-                            
-                            TimeSpan ts = stopwatch.Elapsed;
-                            if (ts < expectedFrameTime)
-                                System.Threading.Thread.Sleep(expectedFrameTime - ts);
-                            stopwatch.Restart();
+
+                            PaceFrame();
                             frameReady = true;
 
                             GpuMode = GpuModeEnum.VBlank;
@@ -157,6 +168,93 @@ namespace ZarthGB
                     }
 			
                     break;
+            }
+        }
+
+        // Throttle emulation to real time. The authoritative clock is the audio device: we advance
+        // an emulated-audio-sample counter each frame and wait until emulation is no more than a
+        // small lead ahead of what the device has actually consumed. That slaves emulation speed to
+        // the sound card's crystal, so note production and playback never drift apart (which is what
+        // caused the periodic tempo wobble). If the device is not running -- or stalls -- we fall
+        // back to a precise self-correcting wall-clock pacer so the emulator never freezes.
+        private void PaceFrame()
+        {
+            double sampleRate = memory.AudioSampleRate;
+
+            if (memory.AudioDeviceRunning)
+            {
+                long consumed = memory.AudioSamplesConsumed;
+
+                // Recover from a previous stall only once the device actually starts consuming again.
+                if (audioStalled && consumed != pacingLastConsumed)
+                {
+                    audioStalled = false;
+                    audioPacing = false;   // force a clean rebase below
+                }
+
+                if (!audioStalled)
+                {
+                    stopwatch.Reset();   // discard the wall-clock baseline; audio is in control now
+
+                    // Allow emulation to run a little ahead of playback (keeps video smooth and the
+                    // device buffer fed) but no further, so the long-term rate matches consumption.
+                    double lead = sampleRate * AudioLeadSeconds;
+
+                    if (!audioPacing)
+                    {
+                        // Took over from the fallback: rebase onto the current playback position so we
+                        // neither stall catching up nor race ahead after the handoff.
+                        audioPacing = true;
+                        emulatedSamples = consumed + lead;
+                        pacingLastConsumed = consumed;
+                        pacingStall.Restart();
+                    }
+
+                    emulatedSamples += sampleRate / FrameRateHz;
+
+                    while (emulatedSamples - memory.AudioSamplesConsumed > lead)
+                    {
+                        long c = memory.AudioSamplesConsumed;
+                        if (c != pacingLastConsumed) { pacingLastConsumed = c; pacingStall.Restart(); }
+                        else if (pacingStall.ElapsedMilliseconds > AudioStallMs) { audioStalled = true; break; }
+                        System.Threading.Thread.Sleep(1);
+                    }
+
+                    if (!audioStalled)
+                        return;   // paced by the audio clock this frame
+
+                    // Device reports Playing but isn't consuming. Fall through to the wall-clock pacer
+                    // so we keep real-time speed (never free-run); pacingLastConsumed stays frozen so
+                    // the recovery check above re-engages audio pacing as soon as the device advances.
+                }
+            }
+            else
+            {
+                audioPacing = false;
+                audioStalled = false;
+            }
+
+            // ---- Wall-clock fallback (device not running, or stalled) ----
+            if (!stopwatch.IsRunning)
+            {
+                stopwatch.Start();
+                nextFrameTime = stopwatch.Elapsed;
+            }
+
+            nextFrameTime += expectedFrameTime;
+
+            TimeSpan remaining = nextFrameTime - stopwatch.Elapsed;
+            if (remaining > TimeSpan.Zero)
+            {
+                TimeSpan spinThreshold = TimeSpan.FromMilliseconds(1.5);
+                if (remaining > spinThreshold)
+                    System.Threading.Thread.Sleep(remaining - spinThreshold);
+                while (stopwatch.Elapsed < nextFrameTime)
+                    System.Threading.Thread.SpinWait(64);
+            }
+            else if (remaining < -expectedFrameTime)
+            {
+                nextFrameTime = stopwatch.Elapsed;
             }
         }
 

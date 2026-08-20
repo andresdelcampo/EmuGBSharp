@@ -29,7 +29,7 @@ namespace ZarthGB
             else
                 //emulator.LoadCartridge("bgbtest.gb");
                 emulator.LoadCartridge("tetris.gb");
-                emulator.LoadCartridge("sml.gb");
+                //emulator.LoadCartridge("sml.gb");
             
             // CPU tests
             //emulator.LoadCartridge("01-special.gb");              // OK!
@@ -57,7 +57,8 @@ namespace ZarthGB
 
         void RunEmulator(object obj)
         {
-            while (true)
+            var token = (CancellationToken) obj;
+            while (!token.IsCancellationRequested)
             {
                 emulator.RunStep();
             }
@@ -127,6 +128,7 @@ namespace ZarthGB
         private void ZarthEmulator_FormClosed(object sender, FormClosedEventArgs e)
         {
             cts.Cancel();
+            emulator.Stop();
         }
         
         private void ZarthEmulator_KeyDown(object sender, KeyEventArgs e)

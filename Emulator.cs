@@ -4,8 +4,8 @@ namespace ZarthGB
 {
     class Emulator
     {
-        private Cartridge cartridge = new Cartridge();
-        private Memory memory = new Memory();
+        private Cartridge cartridge;
+        private Memory memory;
         private Cpu cpu;
         private Video video;
 
@@ -74,6 +74,11 @@ namespace ZarthGB
         {
             cpu.Reset();
             memory.Reset();
+        }
+
+        public void Stop()
+        {
+            memory.StopSound();
         }
     }
 }
