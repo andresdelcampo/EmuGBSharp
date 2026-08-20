@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
-namespace ZarthGB
+namespace EmuGBSharp
 {
     static class Program
     {
@@ -28,7 +28,7 @@ namespace ZarthGB
                 Application.SetHighDpiMode(HighDpiMode.SystemAware);
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                Application.Run(new ZarthEmulator());
+                Application.Run(new MainForm());
             }
             finally
             {

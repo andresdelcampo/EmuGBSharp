@@ -3,9 +3,9 @@ using System.Drawing;
 using System.Threading;
 using System.Windows.Forms;
 
-namespace ZarthGB
+namespace EmuGBSharp
 {
-    public partial class ZarthEmulator : Form
+    public partial class MainForm : Form
     {
         Emulator emulator = new Emulator();
         CancellationTokenSource cts;
@@ -15,12 +15,12 @@ namespace ZarthGB
         Brush DarkGrayBrush = new SolidBrush(Color.DarkGray);
         Brush BlackBrush = new SolidBrush(Color.Black);
 
-        public ZarthEmulator()
+        public MainForm()
         {
             InitializeComponent();
         }
 
-        private void ZarthEmulator_Load(object sender, EventArgs e)
+        private void MainForm_Load(object sender, EventArgs e)
         {
             string[] args = Environment.GetCommandLineArgs();
             
@@ -70,7 +70,7 @@ namespace ZarthGB
                 Render();
         }
 
-        private void ZarthEmulator_Paint(object sender, PaintEventArgs e)
+        private void MainForm_Paint(object sender, PaintEventArgs e)
         {
             Render();
         }
@@ -125,13 +125,13 @@ namespace ZarthGB
             }
         }
 
-        private void ZarthEmulator_FormClosed(object sender, FormClosedEventArgs e)
+        private void MainForm_FormClosed(object sender, FormClosedEventArgs e)
         {
             cts.Cancel();
             emulator.Stop();
         }
         
-        private void ZarthEmulator_KeyDown(object sender, KeyEventArgs e)
+        private void MainForm_KeyDown(object sender, KeyEventArgs e)
         {
             switch (e.KeyCode)
             {
@@ -162,7 +162,7 @@ namespace ZarthGB
             }
         }
 
-        private void ZarthEmulator_KeyUp(object sender, KeyEventArgs e)
+        private void MainForm_KeyUp(object sender, KeyEventArgs e)
         {
             switch (e.KeyCode)
             {

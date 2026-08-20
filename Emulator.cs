@@ -1,6 +1,6 @@
 ﻿using System.Drawing;
 
-namespace ZarthGB
+namespace EmuGBSharp
 {
     class Emulator
     {

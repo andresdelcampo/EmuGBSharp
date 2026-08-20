@@ -3,7 +3,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 16
 VisualStudioVersion = 16.0.31613.86
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ZarthGB", "ZarthGB.csproj", "{87C9C83D-080C-4620-87BC-1E152FB3E4AC}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "EmuGBSharp", "EmuGBSharp.csproj", "{87C9C83D-080C-4620-87BC-1E152FB3E4AC}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

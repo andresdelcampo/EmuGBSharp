@@ -1,7 +1,7 @@
 ﻿
-namespace ZarthGB
+namespace EmuGBSharp
 {
-    partial class ZarthEmulator
+    partial class MainForm
     {
         /// <summary>
         ///  Required designer variable.
@@ -41,7 +41,7 @@ namespace ZarthGB
             this.pictureBox.TabIndex = 0;
             this.pictureBox.TabStop = false;
             // 
-            // ZarthEmulator
+            // MainForm
             // 
             this.AutoScaleDimensions = new System.Drawing.SizeF(12F, 30F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
@@ -49,14 +49,14 @@ namespace ZarthGB
             this.Controls.Add(this.pictureBox);
             this.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedDialog;
             this.MaximizeBox = false;
-            this.Name = "ZarthEmulator";
+            this.Name = "MainForm";
             this.SizeGripStyle = System.Windows.Forms.SizeGripStyle.Hide;
-            this.Text = "Zarth\'s GB Emulator";
-            this.FormClosed += new System.Windows.Forms.FormClosedEventHandler(this.ZarthEmulator_FormClosed);
-            this.Load += new System.EventHandler(this.ZarthEmulator_Load);
-            this.Paint += new System.Windows.Forms.PaintEventHandler(this.ZarthEmulator_Paint);
-            this.KeyDown += new System.Windows.Forms.KeyEventHandler(this.ZarthEmulator_KeyDown);
-            this.KeyUp += new System.Windows.Forms.KeyEventHandler(this.ZarthEmulator_KeyUp);
+            this.Text = "EmuGBSharp";
+            this.FormClosed += new System.Windows.Forms.FormClosedEventHandler(this.MainForm_FormClosed);
+            this.Load += new System.EventHandler(this.MainForm_Load);
+            this.Paint += new System.Windows.Forms.PaintEventHandler(this.MainForm_Paint);
+            this.KeyDown += new System.Windows.Forms.KeyEventHandler(this.MainForm_KeyDown);
+            this.KeyUp += new System.Windows.Forms.KeyEventHandler(this.MainForm_KeyUp);
             ((System.ComponentModel.ISupportInitialize)(this.pictureBox)).EndInit();
             this.ResumeLayout(false);
 
