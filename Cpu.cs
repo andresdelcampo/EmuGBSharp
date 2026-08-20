@@ -8,7 +8,7 @@ using System.Diagnostics;
 // - https://github.com/retrio/gb-test-roms as source for Blargg test roms for CPU instuctions
 // - https://github.com/TheSorm/Boy (for the toughest instructions to pass the Blargg tests, 2-3 would have been impossible to guess)
 
-namespace ZarthGB
+namespace EmuGBSharp
 {
     class Cpu
     {

@@ -1,4 +1,4 @@
-﻿namespace ZarthGB
+﻿namespace EmuGBSharp
 {
     class Sprite
     {

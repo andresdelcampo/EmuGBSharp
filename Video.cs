@@ -8,7 +8,7 @@ using System.Drawing;
 // - https://rylev.github.io/DMG-01/public/book/graphics/tile_ram.html on Tiles and encoding
 // - https://www.youtube.com/watch?v=zQE1K074v3s How Graphics worked on the Nintendo Game Boy | MVG -for LYC register and interrupt!!
 
-namespace ZarthGB
+namespace EmuGBSharp
 {
     class Video
     {

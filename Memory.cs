@@ -8,7 +8,7 @@ using System.Drawing;
 // - https://gist.github.com/drhelius/6063288 on Boot sequence
 // - https://retrocomputing.stackexchange.com/questions/11732/how-does-the-gameboys-memory-bank-switching-work on MBC1 implementation
 
-namespace ZarthGB
+namespace EmuGBSharp
 {
     class Memory
     {

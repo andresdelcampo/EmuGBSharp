@@ -10,7 +10,7 @@ using NAudio.Wave.SampleProviders;
 // - https://gbdev.io/pandocs/Audio.html
 //
 // ============================================================================================
-//  ZarthGB APU (Audio Processing Unit) — how the sound system works
+//  EmuGBSharp APU (Audio Processing Unit) — how the sound system works
 // ============================================================================================
 //
 // PULL-BASED, DEVICE-IS-THE-CLOCK
@@ -64,7 +64,7 @@ using NAudio.Wave.SampleProviders;
 // LATENCY = device buffer (DesiredLatency) + the pacer's lead in Video.PaceFrame.
 // ============================================================================================
 
-namespace ZarthGB
+namespace EmuGBSharp
 {
     // Pull-based Game Boy APU. See the file header for the full overview: the output device pulls
     // mixed stereo frames from the nested ApuProvider, four persistent channels synthesise at
