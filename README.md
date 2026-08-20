@@ -15,9 +15,7 @@ Game Boy Color features and serial/link-cable transfers are not implemented.
 ## Requirements
 
 - Windows
-- A .NET SDK capable of building `net5.0-windows`
-
-The project currently targets .NET 5, which is no longer supported by Microsoft.
+- .NET 10 SDK
 
 ## Build and run
 
