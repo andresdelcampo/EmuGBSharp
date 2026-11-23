@@ -51,3 +51,8 @@ There is currently no automated test project. CPU correctness is checked with Bl
 ## License
 
 See [LICENSE.txt](LICENSE.txt).
+
+
+## More projects
+
+For more of my projects, visit [Software Workshop](https://andresdelcampo.github.io/software-showcase/).
